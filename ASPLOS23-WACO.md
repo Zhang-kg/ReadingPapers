@@ -4,6 +4,28 @@
 
 **内容和主题**
 
+主要内容应该是优化稀疏矩阵相关的乘法。思路是综合考虑三个方面：
+
+- 稀疏矩阵本身的特征
+- 稀疏矩阵存储在内存中的格式 format
+- 稀疏矩阵参与运算时的调度 schedule（schedule 如何理解呢？我们随便写一个稠密矩阵乘法，都有 i j k 三层循环，我们可以决定 i j k 这三层循环如何嵌套；也可以决定是否分块，例如对于 i 的循环是否分成 i1-i0 这样的循环结构）
+
+对于稀疏矩阵本身的特征，本文使用了 WACONet。它相比于以往方法，可以更加综合有效的考虑稀疏矩阵本身的特征；同时避免了手工总结特征的不便捷。
+
+稀疏矩阵本身的特征是稀疏矩阵固有的，而稀疏矩阵如何存储（format）和稀疏矩阵如何调度（schedule）是我们可控的。作者将这部分综合成 SuperSchedule。format 使用前人提出的 format abstraction 总结了大量的 format；schedule 同样使用相似的结构，通过参数控制遍历顺序、是否分块等。
+
+介绍完这些之后，我们了解了本文如何把握优化稀疏矩阵的因素。接下来是本文在这些要素的基础上进行优化。整个思路大概可以认为给定一个模型，前期训练这些模型，积累模型关于矩阵特征、format 和 schedule 的知识。随后给定任意一个矩阵之后，可以通过分析它的稀疏格式，选择最优的 format 和 schedule。
+
+整个过程大概分为如下几步：
+
+- 训练一个 cost model。cost model 的作用是接收稀疏矩阵和 SuperSchedule（SuperSchedule 包含 format 和 schedule 信息），输出一个预测结果。cost model 包含三个部分：
+  - feature extractor：提取稀疏矩阵本身特征
+  - program embedder：提取 format 和 schedule 的信息
+  - runtime predictor：训练获得预测结果
+- 给一个矩阵，检索最优的 SuperSchedule。这里为了更快检索，使用了 ANNS 算法，将这个最优化问题转化为 Nearest Neighbor Search 问题，其中所有的 Neighbor 就是所有的 SuperSchedule（所有的 SuperSchedule 来自于训练集，而训练集中选择 SuperSchedule 是随机选择的）。为了检索，文中构建了一个 KNN 图，ANNS 应用于 KNN 上可以针对给定的矩阵逐步收敛到局部最优的 SuperSchedule
+
+评估，SuperSchedule 整体运行效果不错，但是适用于同一个矩阵乘法多次运行的情况。因为评估运行时间没有考虑搜索时间和格式转化时间。实际上，WACO 的搜索时间比较长。
+
 **结构和组织**
 
 **文体和语言**
@@ -15,6 +37,10 @@
 **创新与价值**
 
 **文章的亮点和缺点**
+
+format abstraction 声称对于所有稀疏矩阵存储格式做了一层抽象，感觉很有意思，肯定得再看看。
+
+使用 KNN 以及 ANNS 搜索方法，是因为本文声称以往算法主要使用黑盒算法，估计是硬搜的。所以可能时间比较长。
 
 **上下文和背景**
 
