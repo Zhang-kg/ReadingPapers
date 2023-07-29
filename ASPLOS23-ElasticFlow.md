@@ -1,5 +1,11 @@
 # ElasticFlow
 
+## HiPO 实验室分享
+
+分享人：fengtianyu
+
+
+
 ## 总结
 
 **内容和主题**
@@ -101,3 +107,64 @@ DDL 驱动的无服务器接口将 DL 问题和系统管理问题解耦。这种
 
 ### 2.2 Limitations of Existing Solutions
 
+不考虑 DL 作业的特征会导致性能低下，如 Kubernetes or YARN。最近的 efforts 要么遵循以服务器为中心的模型，要么忽略了 DL 开发者的性能要求，又如下两个限制：
+
+首先，服务器为中心的模型对于 DL 开发者太底层了：DL 开发者需要显式申请硬件资源、配置机器运行他们的作业。并且 DL 训练工作受到 GPU 硬件资源的限制。他们遇到了两个问题：
+
+- system problem：基于 GPU 内存适应 local batch size 和决定 worker 数量，这个将影响 global batch size 和训练吞吐量
+- DL problem：选择 DL 的超参数
+
+这两个问题在服务器为中心的平台上是交织在一起的（我也有同感，md），对于不具备系统专业知识的 DL 开发者具有挑战性。
+
+其次，现有方案没有通过弹性分配资源从而保证训练任务在 DDL 前完成。大多数解决方案侧重于优化作业完成时间（Job Completion Time, JTC）。虽然对很多场景都有意义，但是还有另一类场景是，当 DL 开发者对作业截至时间有明确期望时。例如，一些生产环境需要模型及时重训并安装模型，便于常规产品发布。
+
+一些 recent work 尝试考虑截至期限，但是他们还是以服务器为中心的，缺乏灵活扩展资源的方式，不能优化集群资源利用并满足 DDL。
+
+## 3. ELASTICFLOW OVERVIEW
+
+### 3.1 Architecture
+
+DL 开发者通过 ElasticFlow 提供的接口向它提交任务，ElasticFlow 根据 DDL 和集群状态动态分配资源给作业。
+
+**ElasticFlow interface.** DL 开发者使用 serverless function 的方式提交作业。一个训练任务 function 包含如下部分：
+
+- DNN model
+- Hyperparameters
+- Termination condition：作业完成条件，最大迭代次数、准确性等
+- Deadline
+- Other training components (datasets, optimizer, etc.).
+
+ElasticFlow 和以往的服务器为中心的平台有两个不同：
+
+- 首先，DL 开发者提交 functions，而系统级别的资源管理以及 local batch size 决定这些事情交给 ElasticFlow
+- 其次，DL 开发者只需要指定 DDL。对于 DL 开发者不用时刻关注什么时刻结束任务了；对于平台来说也可以自主安排资源的分配和释放了——从而简化了开发者和平台的交互
+
+![ASPLOS23-ElasticFlow-fig1](./../../TyporaImage/image-20230726141806566.png)
+
+**ElasticFlow architecture.** 图 1 展示了 ElasticFlow 的结构。Admission Control 模块决定每个到来的任务是否 admit 或者 drop。
+
+Monitor 将集群状态给 Admission Control 模块，Admission Control 计算该工作的最小需要资源数量。
+
+Resource Allocation 模块调度 admitted 的任务，从而有效利用资源。当某个调度事件，如新任务到来或者某个任务完成，资源分配模块就会分配任务的资源。该模块还会计算戈丁作业的 local batch size（global batch size / GPU 数量）。
+
+Job placement 模块根据拓扑结构选择 GPU，决定 GPU 之后，该模块将任务发送给 elastic training executor，这是一个可以被任何 elastic DL framework 替换的插入组件（plugged-in component）。
+
+Elastic training executor 保证每台机器正确执行 DL 任务。
+
+**Performance guarantee.** 保证每个被纳入系统的任务的 DDL。
+
+### 3.2 Challenges
+
+![ASPLOS23-ElasticFlow-fig2](./../../TyporaImage/image-20230726143433850.png)
+
+**Non-linear scaling.** 吞吐量不会随着 worker 的数量增加而线性增加。DL 的 scaling 曲线通常是凹形的（concave）。如图 2a，集群使用的 8 个 NVIDIA A100 GPU 和 8 个 NVIDIA Mellanox HDR InfiniBand HCAs，内部使用 200 GB/s 的 InfiniBand 网络连接。
+
+ElasticFlow 将会考虑到非线性的 scaling。
+
+![ASPLOS23-ElasticFlow-fig3](./../../TyporaImage/image-20230726144431991.png)
+
+Deadline-aware scheduling 不是一个新鲜的话题：传统使用 Earliest-Deadline-First (EDF) 技术。这种技术将任务按照 DDL 排序，每个任务假设一个 worker，认为整体吞吐量是各自吞吐量之和。这种方法不适合非线性环境。
+
+> 如图 3，假设一个 worker 的吞吐量为 1，两个吞吐量为 1.5；任务 A 和 B DDL 分别是 3 和 3.5；任务 A 和 B job size 都为 3。则此时 EDF 技术就无法完成两个任务（图 3b）；如果每个任务分配一个 worker，就可以完成任务（图 3c）
+
+**Topology-dependent placement.** 

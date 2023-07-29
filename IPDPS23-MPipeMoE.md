@@ -180,7 +180,7 @@ All-to-All 操作是 MoE 模型的瓶颈。Pipeline parallelism 可以减少通�
 
 ![IPDPS23-MPipeMoE-fig5](./imgs/IPDPS23-MPipeMoE-fig5.png)
 
-![IPDPS-MPipeMoE-outfig1](./imgs/IPDPS-MPipeMoE-outfig1.png)
+![IPDPS23-MPipeMoE-outfig1](./imgs/IPDPS23-MPipeMoE-outfig1.png)
 
 （这是介绍什么是 All-to-All 的图片，可以看到每个 XPU 中的数据既包含自己的 XPU 的数据也包含其他 XPU 的数据，最终将数据分发给所有 XPU）
 
@@ -227,31 +227,176 @@ MoE 模型的训练过程中，tokens 的 batch size 被划分为 n 个 partitio
 
 ### D. Memory Reusing
 
+![IPDPS23-MPipeMoE-fig6](./imgs/IPDPS23-MPipeMoE-fig6.png)
+
+向量 $T_{DI},T_M, T_{DO}$ 在 pipeline 中被划分成 n 个 partitions。不同的 partition 在 pipeline 的不同时间被 activated，产生了“内存气泡”，如图 6 上边所示。不同 partitions 中的相同操作用单个 Steam 流 pipeline 最终流水线式执行。
+
+这些操作的 input 或 output 向量可以在分区之间共享，以减少内存冗余。例如 $T_M$ 来说，一个时间只有一个 partition 是活跃的。因此我们可以只分配一个缓冲区内存存储 $T_M$ 的 partition。相似的，对于 $T_{DI}$，也只需要两个缓冲区内存，如图 6 的下半部分（每个向量右边的小格子表示需要的缓冲区内存）。
+
+内存重用方法适用于临时缓冲区。临时缓冲区的峰值内存等于 pipeline parallelism 的 activations 大小，因此可以从公式 4 中得到 $M_{buf}^{pipe}$。当内存重用时，相应减少的内存 $\Delta M_{buf}=\Delta M_{act}$，如公式 5.
+$$
+M_{buf}^{pipe}=M_{act}^{pipe}=4*B*M+B*H & (4)\\
+\Delta M_{buf}=\Delta M_{act}=B*(2M*\frac{n-2}{n}+H*\frac{n-1}{n}) & (5)\\
+\phi=\frac{\Delta M_{act}+\Delta M_{buf}}{M_{ms}+M_{act}^{pipe}+M_{buf}^{pipe}}&(6)
+$$
+（这里我觉得有必要再解释一下 $\Delta M_{buf}$ 是怎么来的。不适用 memory reuse 的情况下，$M_{buf}$ 大小等于 $M_{act}$ 的；当使用 memory reuse 的情况下，如图可以看到 $M_{T_I}=B*M$, $M_{T_{DI}}=2*B*M/n$, $M_{T_M}=B*H/n$, $M_{T_{DO}}=2*B*M/n$, $M_{T_O}=B*M$。所以加起来就是最终的 buffer 的大小，再与原来的 buffer 大小相减可以发现最终是 $\Delta M_{buf}$。==但是这里说 $\Delta M_{buf}=\Delta M_{act}$ 难道是说 activation 本身也减少了吗？==）
+
+最终，我们得到了模型 memory saving ratio $\phi$，如公式 6 所示。
+
+通过使用 memory reuse 技术 $T_{DI}$ 和 $T_M$ 将会被其他覆盖。但是这两个张量需要在之后的环节中使用，所以需要找个方式保留这两个张量。
+
+- Data offloading。利用 GPU 支持通信和计算重叠，我们可以在计算时将数据传回 CPU。在 backward 中，我们再将数据提前预取回 GPU
+- Communication and Re-computation。向量 $T_{DI}$ 可以通过向量 $T_I$ 再次计算。$T_M$ 也可以被重新计算。理想情况下，如果通信是瓶颈，则可以使用重计算。
+
+![IPDPS23-MPipeMoE-fig7](./imgs/IPDPS23-MPipeMoE-fig7.png)
+
+最终有 4 个 memory reuse 技术，即 MoE 训练中的S1、S2、S3和S4，如图7(b)-7(e)所示。
+
+不同的方案区分了采用不同方案来恢复 $T_{DI}$ 和 $T_M$。由于不同 partition 之间的操作没有依赖性，所以 S 和 R 通过交错的方式执行。
+
+S1、S2 和 S3 都需要额外的一个 CUDA stream 来执行 memory copy 操作。
+
+此外，device to host 和 host to device 的内存复制操作分别涉及到 forward 和 backward。在 S2 和 S4 中，引入了额外的通信操作来恢复 $T_{DI}$。重新计算 $T_M$ 的操作也在 S3 和 S4 中引入。
+
+![IPDPS23-MPipeMoE-table2](./imgs/IPDPS23-MPipeMoE-table2.png)
+
+（==这里感觉图中的 H 和 D 画反了==）
+
 ### E. Performance Model on Memory Reusing Strategies
+
+使用 Section 2C 的假设，计算、通信和内存复制的速度分别为 $\sigma_xW_{comp}, \mu_xW_{comm},\eta_xW_{mem}$。其中 x 表示其他流的干扰。
+
+为了简单起见，我们定义 $v0=[v_{0, comp}, v_{0, comm}, v_{0, mem}]$ 是公式 7 到 9 的不同类型的操作，其中 H 和 M 的含义如 table1 定义。
+$$
+v_{0,comp}=b*H*M &(7)\\
+v_{0,comm}=b*M& (8)\\
+v_{0,mem}=b*M &(9)
+$$
+其中，$v_{0, comm}$ 和 $v_{0, comp}$ 是 MoE 中浮点数操作数和 All-to-All 通信数。$v_{0,mem}$ 是在 host 和 device 中移动向量 $T_{DI}$ 的数据容量。由于大多数 MoE 模型中 H=4M，所以复制张量 $T_M$ 需要的数据是 $v_{0, mem}$ 的四倍。
+
+为了量化三个流上的工作负载，我们定义 $Q=[q_1, q_2, q_3]$ 来表示对应操作的数量。例如，如果不进行 memory using，则 $Q_{fw}=[2,2,0]$，表示 forward 中有两次 GeMM 操作和两次 All-to-All 操作。同样的，我们也可以得到四种内存重用策略的 $Q_{fw}$ 和 $Q_{bw}$，如表 2 所示。
+
+（这里给一个理解和解释思考的过程：
+
+- 观察可以发现 forward 阶段都是需要 2 次 GeMM 操作，而 backward 阶段都需要 4 次 GeMM 操作，如果使用 re-computation 技术，则需要 5 次 GeMM 操作。==但是我不理解为什么需要这么多次 GeMM 操作==
+- 再来观察 $T_M,T_{DI}$ 的 offload，根据规律的话可以看到这两个分别 offload 需要 4 次和 1 次操作，我感觉和图 6 有关。由于 $H=4M$ 所以移动 $T_M$ 的次数是移动 $T_{DI}$ 次数的四倍。==这里的数字并不是严格意义上的次数，而是相对而言的。移动 $T_M$ 的 4 表示移动四个 Batch 的量。这里再次吐槽：公式 7-9 中的 b 没有给出定义，是否是 B 写错了？==）
+
+特定流的执行时间等于总操作数除以执行时间。例如，计算时间是 $\frac{q_1v_{0, comp}}{\sigma W_{comp}}$。同时，总执行时间等于三个流中执行最慢的时间。公式 10 中定义了总执行时间 Q。由于每秒浮点操作执行时间稳定，所以 $\alpha$ 和 $\beta$ 几乎是恒定的。
+$$
+C&=&\max(\frac{q_1v_{0, comp}}{\sigma W_{comp}}, \frac{q_2v_{0, comm}}{\mu W_{comm}}, \frac{q_3 v_{0, mem}}{\eta W_{mem}})&\\
+&\approx&\frac{1}{W_{comp}}\max(q_1, q_2\alpha/\mu, q_3\beta/\eta)& (10)\\
+&=&\frac{1}{W_{comp}}\max(Q\cdot[1, 1/\mu, 1/\eta]\cdot[1,\alpha, \beta])\\
+$$
+其中 $\alpha=\frac{W_{comp}}{W_{comm}}, \beta=\frac{W_{comp}}{W_{mem}}$。
+
+表 2 中总结了四种策略的特点。根据公式 10，我们获得了所有策略的成本 C，从中选择成本最低的策略作为最优内存重用策略。
+
+一般来说，策略 S1 和 S2 引入了更多的内存复制操作，可能导致 I/O 瓶颈；S3 和 S4 可能导致计算瓶颈。
 
 ## 4. Implementation
 
+MPipeMoE 实现在 CUDA 11.1 torch 1.9.0
+
+一些关键组件和功能实现如下
+
 ### A. Gating network and Experts
+
+Gating network 使用 top-k 算法将 tokens 导引到 experts 处。本文中，我们假设 k = 1.增加 k 和增加 B 是等价的。我们实现了一个前馈神经网络作为专家，适用于大多数 transformer 模型。
 
 ### B. Expert Parallelism
 
+使用 expert parallelism 将 experts 分布在不同 GPU 上，并且使用 data-parallel 方式运行 MoE 其他部分。
+
+NCCL All-to-All 通信策略分布和收集 tokens
+
 ### C. Usability
+
+MPipeMoE 很容易：
+
+```python
+import pmoe
+moe_layer = pmoe.MoELayer(d_mode=1024, 
+                         d_hidden=4096,
+                         top_k=1,
+                         num_experts=64,
+                         pipeline=True,
+                         memory_reuse=True)
+```
 
 ## 5. Evaluation
 
 ### A. Experimental Setup
 
+**Physical cluster:** 在 8 个 NVIDIA DGX A100 40G GPU 上和 200 Gbps HDR InfiniBand 上，96 x 2nd-generation AMD EPYC CPU 核以及 1.9 TB 内存。GPU 使用第三代 NVLink 核 NVSwitch 连接。不同机器间 GPU 通过 1600 Gbps InfiniBand 的自适应网络连接。
+
+**Models and configurations:** 不同模型的主要区别是模型大小，由 M 和 H 以及 token 数量 B 决定。
+
+我们的目标是验证在不同模型大小和 batch size 上的效率。
+
+如表 3，我们配置了 Bert 和 GPT3 的不同大小。其中 $d_{model}$ 表示 token embedding 的维度，$d_{hidden}$ 表示 FFN 层的 hidden dimension。
+
+所有实验都是用 Adam 优化器。
+
+从平均训练时间和峰值内存占用查看 MPipeMoE 的运行时间。
+
 ### B. Methodology
+
+![IPDPS23-MPipeMoE-fig8](./imgs/IPDPS23-MPipeMoE-fig8.png)
+
+将 MPipeMoE 和 FasterMoE 比较，后者使用了动态跟踪（dynamic shadowing）和 pipeline parallelism。也和 FastMoE 比较，后者使用了 expert parallelism。
+
+我们额外实现了 PipeMoE，用来展示自适应 pipeline parallelism 的优势。
 
 ### C. Overall Speedup
 
+图 8 展示了 PipeMoE 在模型训练时的加速。和 FasterMoE 相比，PipeMoE 实现了平均 2.26 倍的加速。和 FastMoE 相比，PipeMoE 实现了 3.7 倍的加速。
+
+PipeMoE 相比 FasterMoE 可以达到 3.4 倍的加速比，很大程度上由于 pipeline 粒度的优化。PipeMoE 还可以利用 Tensor Core 来加速计算。（==这里看图片当 n = 1 时加速比很大，而 n=1 和不限制 n 的 PipeMoE 相差并不是很大，为什么说粒度的优化带来的主要的加速效果呢？==）
+
+为了验证 pipeline parallelism 的效果，我们将 PipeMoE 和 n = 1 的 PipeMoE 比较。n = 1 中，通信和计算是顺序执行的，pipeline 的实现为多种模型不同 batch size 都带来了优化。
+
+唯一例外是 B = 4k 的 GPT-S，他不是一个计算密集型的任务。结果表明 pipeline 不能对非计算密集型的带来收益，因为额外的内核启动导致 GPU 利用率降低。
+
 ### D. Memory Footprint Reduction
+
+![IPDPS23-MPipeMoE-fig9](./imgs/IPDPS23-MPipeMoE-fig9.png)
+
+图 9 展示了内存占用。左边的 y 轴表示内存占用，使用 FastMoE 归一化。结果表明 MPipeMoE 平均优化了 23%，最高优化了 40%，同时可以达到 3.1 倍的加速比。
+
+由于 dynamic shadowing 和 smart scheduling，FasterMoE 需要更多的内存占用。
+
+![IPDPS23-MPipeMoE-fig10](./imgs/IPDPS23-MPipeMoE-fig10.png)
+
+公式 6 证明了 MPipeMoE 的理论内存优化峰值。如图 10 所示，我们验证了理论的正确性，最终达到了 95% 的理论边界。
 
 ### E. Performance Breakdown
 
+![IPDPS23-MPipeMoE-fig11](./imgs/IPDPS23-MPipeMoE-fig11.png)
+
+测试不同方法在 memory-time 中的性能。x 轴表示内存占用，y 轴表示训练时间。越靠近原点表示性能越好。
+
+n=4 中由具有更好的 GPU 吞吐量减少的训练时间更多。PipeMoE 相比于 n=4 的更好因为调整了 pipeline 粒度。
+
+MPipeMoE 由于 memory reuse 所以内存更好。
+
 ### F. Effectiveness of Granularity Configurations
 
+![IPDPS23-MPipeMoE-fig12](./imgs/IPDPS23-MPipeMoE-fig12.png)
+
+当 batch size 小于 8k 时，n = 2；当 batch size 大于 22k 时，n = 8 最好。
+
 ### G. Overhead of Memory Reusing
+
+![IPDPS23-MPipeMoE-fig13](./imgs/IPDPS23-MPipeMoE-fig13.png)
+
+对于四种内存策略开销分析，我们在不同 GPU 数量 N 和 batch size B 下进行实验。图 13 展示结果。从中可以看到：
+
+- 当 N 较小时，S1 和 S2 表现更好。
+- S3 和 S4 引入了计算开销，如果工作负载是计算瓶颈的，则表现很差，如 N = 8
+- 如果N等于32或64，S4的性能优于S2，其中通信是瓶颈，因为S2中PCIe上的内存复制减缓了通信操作
+- 不同 batch size 的性能变化不大，说明 batch size 对策略的配置不敏感。
+
+基于这些观察结果，我们可以得出结论，不存在一个单一的内存重用策略，可以确保在所有情况下的最佳性能。MPipeMoE 建立了一个基于公式 10 的性能模型，同时考虑硬件配置和运行时特性来确定最优策略。
 
 ## 6. Related Work
 
